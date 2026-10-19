@@ -56,7 +56,7 @@ metadata:
 rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliques"]
-  verbs: ["get"]
+  verbs: ["get", "list", "watch"]
 {{- if (and $.Values.resources.gpus.enabled (and $.Values.featureGates (and (hasKey $.Values.featureGates "MPSSupport") $.Values.featureGates.MPSSupport))) }}
 - apiGroups: ["apps"]
   resources: ["deployments"]

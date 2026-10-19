@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,12 +25,12 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
@@ -219,18 +219,21 @@ func (s *ComputeDomainDaemonSettings) GetCDIContainerEditsCommon(ctx context.Con
 	if err != nil {
 		return nil, fmt.Errorf("error getting compute domain %s: %w", s.domainID, err)
 	}
-	if cd == nil {
-		return nil, fmt.Errorf("compute domain not found: %s", s.domainID)
+
+	env := []string{
+		fmt.Sprintf("CLIQUE_ID=%s", s.manager.CliqueID()),
+	}
+	if cd != nil {
+		env = append(env,
+			fmt.Sprintf("COMPUTE_DOMAIN_UUID=%s", cd.UID),
+			fmt.Sprintf("COMPUTE_DOMAIN_NAME=%s", cd.Name),
+			fmt.Sprintf("COMPUTE_DOMAIN_NAMESPACE=%s", cd.Namespace),
+		)
 	}
 
 	edits := &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
-			Env: []string{
-				fmt.Sprintf("CLIQUE_ID=%s", s.manager.CliqueID()),
-				fmt.Sprintf("COMPUTE_DOMAIN_UUID=%s", cd.UID),
-				fmt.Sprintf("COMPUTE_DOMAIN_NAME=%s", cd.Name),
-				fmt.Sprintf("COMPUTE_DOMAIN_NAMESPACE=%s", cd.Namespace),
-			},
+			Env: env,
 			Mounts: []*cdispec.Mount{
 				{
 					// imexDaemonConfigDirPath   = "/imexd"
@@ -300,33 +303,32 @@ func (s *ComputeDomainDaemonSettings) WriteConfigFile(ctx context.Context) error
 }
 
 func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdUID string) error {
+	if featuregates.Enabled(featuregates.ComputeDomainCliques) {
+		ready, err := m.isCurrentNodeReadyInClique(ctx, cdUID)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+	}
+
 	cd, err := m.GetComputeDomain(ctx, cdUID)
 	if err != nil {
 		return fmt.Errorf("error getting ComputeDomain: %w", err)
 	}
-	if cd == nil {
-		return fmt.Errorf("ComputeDomain not found: %s", cdUID)
-	}
-
-	// Check if the current node is ready in the ComputeDomain
-	if !m.isCurrentNodeReady(ctx, cd) {
+	if cd != nil {
+		if m.isCurrentNodeReadyInStatus(cd) {
+			return nil
+		}
 		return fmt.Errorf("current node not ready in ComputeDomain")
 	}
 
-	return nil
-}
-
-// isCurrentNodeReady checks if the current node is marked as ready in the ComputeDomain.
-// When the feature gate is enabled, we check both the clique and the status to ensure
-// that compute domains started before the feature gate was enabled continue to work
-// even after the feature gate is enabled.
-func (m *ComputeDomainManager) isCurrentNodeReady(ctx context.Context, cd *nvapi.ComputeDomain) bool {
-	if featuregates.Enabled(featuregates.ComputeDomainCliques) {
-		if m.isCurrentNodeReadyInClique(ctx, cd) {
-			return true
-		}
+	if m.CliqueID() == "" && m.isCurrentNodeReadyInDaemonPod(ctx, cdUID) {
+		return nil
 	}
-	return m.isCurrentNodeReadyInStatus(cd)
+
+	return fmt.Errorf("current node not ready in ComputeDomain")
 }
 
 // isCurrentNodeReadyInStatus checks if the current node is marked as ready in the ComputeDomain status.
@@ -339,9 +341,36 @@ func (m *ComputeDomainManager) isCurrentNodeReadyInStatus(cd *nvapi.ComputeDomai
 	return false
 }
 
-// isCurrentNodeReadyInClique checks if the current node is marked as ready in the ComputeDomainClique.
-func (m *ComputeDomainManager) isCurrentNodeReadyInClique(ctx context.Context, cd *nvapi.ComputeDomain) bool {
-	cliqueName := fmt.Sprintf("%s.%s", cd.UID, m.CliqueID())
+// isCurrentNodeReadyInClique checks if the current node is marked as ready in the
+// ComputeDomainClique for cdUID and enforces the multi-clique split guard.
+func (m *ComputeDomainManager) isCurrentNodeReadyInClique(ctx context.Context, cdUID string) (bool, error) {
+	cliques, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliques(m.config.flags.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", computeDomainLabelKey, cdUID),
+	})
+	if err != nil {
+		return false, fmt.Errorf("error listing ComputeDomainCliques for domain %s: %w", cdUID, err)
+	}
+	if len(cliques.Items) > 1 {
+		return false, permanentError{fmt.Errorf("ComputeDomain %s spans multiple cliques (%d found); split guard triggered", cdUID, len(cliques.Items))}
+	}
+
+	if m.CliqueID() == "" {
+		return false, nil
+	}
+
+	cliqueName := fmt.Sprintf("%s.%s", cdUID, m.CliqueID())
+	for i := range cliques.Items {
+		clique := &cliques.Items[i]
+		if clique.Name != cliqueName {
+			continue
+		}
+		for _, daemon := range clique.Daemons {
+			if daemon.NodeName == m.config.flags.nodeName {
+				return daemon.Status == nvapi.ComputeDomainStatusReady, nil
+			}
+		}
+		return false, nil
+	}
 
 	clique, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliques(m.config.flags.namespace).Get(ctx, cliqueName, metav1.GetOptions{})
 	if err != nil {
@@ -350,15 +379,39 @@ func (m *ComputeDomainManager) isCurrentNodeReadyInClique(ctx context.Context, c
 			// exists, Prepare() keeps retrying, so this is an expected
 			// transient state rather than a failure.
 			klog.V(1).Infof("ComputeDomainClique %s not created yet", cliqueName)
-			return false
+			return false, nil
 		}
 		klog.Errorf("error getting ComputeDomainClique %s: %v", cliqueName, err)
-		return false
+		return false, nil
 	}
 
 	for _, daemon := range clique.Daemons {
 		if daemon.NodeName == m.config.flags.nodeName {
-			return daemon.Status == nvapi.ComputeDomainStatusReady
+			return daemon.Status == nvapi.ComputeDomainStatusReady, nil
+		}
+	}
+	return false, nil
+}
+
+// isCurrentNodeReadyInDaemonPod checks if the daemon pod for cdUID on the current
+// non-fabric node has reached PodReady.
+func (m *ComputeDomainManager) isCurrentNodeReadyInDaemonPod(ctx context.Context, cdUID string) bool {
+	pods, err := m.config.clientsets.Core.CoreV1().Pods(m.config.flags.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", computeDomainLabelKey, cdUID),
+	})
+	if err != nil {
+		klog.Errorf("error listing daemon pods for domain %s: %v", cdUID, err)
+		return false
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Spec.NodeName != m.config.flags.nodeName {
+			continue
+		}
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				return true
+			}
 		}
 	}
 	return false
@@ -504,7 +557,7 @@ func (m *ComputeDomainManager) periodicGPUCliqueIDRefresh(ctx context.Context) {
 	}
 }
 
-// refreshGPUCliqueLabel re-reads the GPU clique ID and, if it differs from
+// refreshGPUCliqueID re-reads the GPU clique ID and, if it differs from
 // the last known value, updates the in-memory state and the node label.
 func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 	newCliqueID, err := m.getCliqueIDFunc()

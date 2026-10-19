@@ -114,7 +114,7 @@ func (g *PreparedDeviceGroup) GetDevices() []kubeletplugin.Device {
 	return devices
 }
 
-// GetNonAdminDevices returns a map of device names that were requested
+// GetNonAdminDevices returns a map of device keys that were requested
 // without admin access in the prepared claim.
 func (c *PreparedClaim) GetNonAdminDevices() map[string]struct{} {
 	if c.Status.Allocation == nil {
@@ -129,7 +129,7 @@ func (c *PreparedClaim) GetNonAdminDevices() map[string]struct{} {
 		if r.AdminAccess != nil && *r.AdminAccess {
 			continue
 		}
-		requested[r.Device] = struct{}{}
+		requested[deviceRequestKey(r)] = struct{}{}
 	}
 	return requested
 }
