@@ -17,27 +17,45 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+
+	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 )
 
 const (
 	domainClaimFinalizer = computeDomainFinalizer
+
+	domainConditionReady             = "Ready"
+	domainConditionDomainProvisioned = "DomainProvisioned"
+	domainConditionNodesReady        = "NodesReady"
+	domainConditionCliqueSplit       = "CliqueSplit"
 )
+
+type domainDeviceStatusData struct {
+	Cliques []string                   `json:"cliques"`
+	Nodes   []*nvapi.ComputeDomainNode `json:"nodes"`
+}
 
 // DomainClaimManager watches ResourceClaims across all namespaces, filters to
 // allocated domain claims (pool prefix "nvlink-domain-"), creates the
-// per-domain IMEX DaemonSet when allocated, and tears down the DaemonSet,
+// per-domain IMEX DaemonSet when allocated, reports domain readiness on
+// ResourceClaim.status.devices[], and tears down the DaemonSet,
 // ComputeDomainCliques, and leftover node labels when the claim is deallocated
 // or deleted.
 type DomainClaimManager struct {
@@ -68,7 +86,8 @@ func NewDomainClaimManager(config *ManagerConfig, daemonSetManager *DaemonSetMan
 }
 
 // Start registers the UID indexer and event handlers, starts the ResourceClaim
-// informer factory, and waits for cache synchronization.
+// informer factory, waits for cache synchronization, and launches the periodic
+// ResourceClaim.status.devices[] sync loop.
 func (m *DomainClaimManager) Start(ctx context.Context) (rerr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelContext = cancel
@@ -149,10 +168,16 @@ func (m *DomainClaimManager) Start(ctx context.Context) (rerr error) {
 		return fmt.Errorf("DomainClaimManager: ResourceClaim informer cache sync failed")
 	}
 
+	m.waitGroup.Add(1)
+	go func() {
+		defer m.waitGroup.Done()
+		m.startPeriodicStatusSync(ctx)
+	}()
+
 	return nil
 }
 
-// Stop stops the DomainClaimManager informer loop.
+// Stop stops the DomainClaimManager informer and status sync loops.
 func (m *DomainClaimManager) Stop() error {
 	if m.cancelContext != nil {
 		m.cancelContext()
@@ -266,6 +291,10 @@ func (m *DomainClaimManager) onAddOrUpdate(ctx context.Context, obj any) error {
 		}
 	}
 
+	if err := m.syncClaimDeviceStatus(ctx, claim); err != nil {
+		klog.V(4).Infof("DomainClaimManager: transient error syncing device status for ResourceClaim %s/%s: %v", claim.Namespace, claim.Name, err)
+	}
+
 	return nil
 }
 
@@ -275,6 +304,340 @@ func (m *DomainClaimManager) onDelete(ctx context.Context, obj any) error {
 		return fmt.Errorf("failed to cast to ResourceClaim")
 	}
 	return m.cleanupClaimResources(ctx, string(claim.UID))
+}
+
+func (m *DomainClaimManager) startPeriodicStatusSync(ctx context.Context) {
+	ticker := time.NewTicker(cdStatusSyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.syncAllActiveClaimsStatus(ctx)
+		}
+	}
+}
+
+func (m *DomainClaimManager) syncAllActiveClaimsStatus(ctx context.Context) {
+	for _, obj := range m.informer.GetStore().List() {
+		claim, ok := obj.(*resourceapi.ResourceClaim)
+		if !ok || claim == nil {
+			continue
+		}
+		if !claim.DeletionTimestamp.IsZero() || !isAllocatedDomainClaim(claim) {
+			continue
+		}
+		latest, err := m.Get(string(claim.UID))
+		if err != nil || latest == nil || !latest.DeletionTimestamp.IsZero() || !isAllocatedDomainClaim(latest) {
+			continue
+		}
+		if err := m.syncClaimDeviceStatus(ctx, latest); err != nil {
+			klog.V(4).Infof("DomainClaimManager: error syncing device status for ResourceClaim %s/%s: %v", latest.Namespace, latest.Name, err)
+		}
+	}
+}
+
+// syncClaimDeviceStatus computes and updates ResourceClaim.status.devices[] for
+// all domain device allocations on the claim.
+func (m *DomainClaimManager) syncClaimDeviceStatus(ctx context.Context, claim *resourceapi.ResourceClaim) error {
+	if claim == nil || claim.Status.Allocation == nil || !claim.DeletionTimestamp.IsZero() {
+		return nil
+	}
+
+	claimUID := string(claim.UID)
+
+	// 1. Check whether the per-domain DaemonSet exists.
+	daemonSetExists := false
+	if m.daemonSetManager != nil {
+		ds, err := m.daemonSetManager.Get(ctx, claimUID)
+		if err != nil {
+			return fmt.Errorf("error checking DaemonSet for claim %s: %w", claimUID, err)
+		}
+		daemonSetExists = ds != nil
+	}
+
+	// 2. Count nodes labeled resource.nvidia.com/computeDomain=<claim.UID>.
+	labeledNodes, err := m.config.clientsets.Core.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", computeDomainLabelKey, claimUID),
+	})
+	if err != nil {
+		return fmt.Errorf("error listing labeled nodes for claim %s: %w", claimUID, err)
+	}
+	expectedNodes := len(labeledNodes.Items)
+
+	// 3. List ComputeDomainClique objects for this claim UID.
+	cliques, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliques(m.config.driverNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", computeDomainLabelKey, claimUID),
+	})
+	if err != nil {
+		return fmt.Errorf("error listing ComputeDomainCliques for claim %s: %w", claimUID, err)
+	}
+
+	var cliqueNames []string
+	var domainNodes []*nvapi.ComputeDomainNode
+	seenNodes := make(map[string]struct{})
+
+	for i := range cliques.Items {
+		clique := &cliques.Items[i]
+		cliqueID := clique.Labels[computeDomainCliqueLabelKey]
+		if cliqueID == "" {
+			cliqueID = clique.Name
+		}
+		if !slices.Contains(cliqueNames, cliqueID) {
+			cliqueNames = append(cliqueNames, cliqueID)
+		}
+		for _, daemon := range clique.Daemons {
+			if _, exists := seenNodes[daemon.NodeName]; exists {
+				continue
+			}
+			seenNodes[daemon.NodeName] = struct{}{}
+			domainNodes = append(domainNodes, &nvapi.ComputeDomainNode{
+				Name:      daemon.NodeName,
+				IPAddress: daemon.IPAddress,
+				CliqueID:  daemon.CliqueID,
+				Index:     daemon.Index,
+				Status:    daemon.Status,
+			})
+		}
+	}
+
+	// Fallback for non-fabric daemon pods where no ComputeDomainClique is created.
+	if len(domainNodes) == 0 && expectedNodes > 0 {
+		pods, err := m.config.clientsets.Core.CoreV1().Pods(m.config.driverNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", computeDomainLabelKey, claimUID),
+		})
+		if err == nil {
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				if pod.Spec.NodeName == "" || pod.Status.PodIP == "" {
+					continue
+				}
+				if _, exists := seenNodes[pod.Spec.NodeName]; exists {
+					continue
+				}
+				seenNodes[pod.Spec.NodeName] = struct{}{}
+				status := nvapi.ComputeDomainStatusNotReady
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+						status = nvapi.ComputeDomainStatusReady
+						break
+					}
+				}
+				domainNodes = append(domainNodes, &nvapi.ComputeDomainNode{
+					Name:      pod.Spec.NodeName,
+					IPAddress: pod.Status.PodIP,
+					CliqueID:  "",
+					Index:     -1,
+					Status:    status,
+				})
+			}
+		}
+	}
+
+	slices.Sort(cliqueNames)
+	slices.SortFunc(domainNodes, func(a, b *nvapi.ComputeDomainNode) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	if cliqueNames == nil {
+		cliqueNames = []string{}
+	}
+	if domainNodes == nil {
+		domainNodes = []*nvapi.ComputeDomainNode{}
+	}
+
+	readyNodes := 0
+	for _, node := range domainNodes {
+		if node.Status == nvapi.ComputeDomainStatusReady {
+			readyNodes++
+		}
+	}
+	if expectedNodes < len(domainNodes) {
+		expectedNodes = len(domainNodes)
+	}
+
+	isSplit := len(cliques.Items) > 1
+	allNodesReady := expectedNodes > 0 && readyNodes == expectedNodes
+	isReady := daemonSetExists && allNodesReady && !isSplit
+
+	rawData, err := json.Marshal(domainDeviceStatusData{
+		Cliques: cliqueNames,
+		Nodes:   domainNodes,
+	})
+	if err != nil {
+		return fmt.Errorf("error marshaling domainDeviceStatusData: %w", err)
+	}
+
+	// Preserve AllocatedDeviceStatus entries owned by other drivers.
+	var newDevices []resourceapi.AllocatedDeviceStatus
+	for i := range claim.Status.Devices {
+		dev := &claim.Status.Devices[i]
+		if dev.Driver == DriverName && strings.HasPrefix(dev.Pool, domainPoolPrefix) {
+			continue
+		}
+		newDevices = append(newDevices, *dev.DeepCopy())
+	}
+
+	now := metav1.Now()
+	for i := range claim.Status.Allocation.Devices.Results {
+		res := &claim.Status.Allocation.Devices.Results[i]
+		if res.Driver != DriverName || !strings.HasPrefix(res.Pool, domainPoolPrefix) {
+			continue
+		}
+
+		var shareID *string
+		if res.ShareID != nil {
+			s := string(*res.ShareID)
+			shareID = &s
+		}
+
+		existing := findExistingAllocatedDeviceStatus(claim.Status.Devices, res.Driver, res.Pool, res.Device, shareID)
+
+		provStatus := metav1.ConditionFalse
+		provReason := "DaemonSetPending"
+		provMsg := "Waiting for IMEX DaemonSet creation"
+		if daemonSetExists {
+			provStatus = metav1.ConditionTrue
+			provReason = "DaemonSetCreated"
+			provMsg = fmt.Sprintf("IMEX DaemonSet computedomain-daemon-%s provisioned in %s", claimUID, m.config.driverNamespace)
+		}
+
+		nodesStatus := metav1.ConditionFalse
+		nodesReason := "NodesNotReady"
+		if allNodesReady {
+			nodesStatus = metav1.ConditionTrue
+			nodesReason = "AllNodesReady"
+		}
+		nodesMsg := fmt.Sprintf("%d/%d", readyNodes, expectedNodes)
+
+		splitStatus := metav1.ConditionFalse
+		splitReason := "SingleClique"
+		splitMsg := "All domain daemons belong to a single NVLink clique"
+		if isSplit {
+			splitStatus = metav1.ConditionTrue
+			splitReason = "MultipleCliquesDetected"
+			splitMsg = fmt.Sprintf("Domain spans %d cliques", len(cliques.Items))
+		}
+
+		readyStatus := metav1.ConditionFalse
+		readyReason := "Provisioning"
+		readyMsg := fmt.Sprintf("Provisioning IMEX domain (%d/%d nodes ready)", readyNodes, expectedNodes)
+		if isSplit {
+			readyReason = "CliqueSplit"
+			readyMsg = fmt.Sprintf("IMEX domain split across %d cliques", len(cliques.Items))
+		} else if isReady {
+			readyStatus = metav1.ConditionTrue
+			readyReason = "DomainReady"
+			readyMsg = fmt.Sprintf("IMEX domain ready across %d/%d nodes", readyNodes, expectedNodes)
+		}
+
+		conditions := []metav1.Condition{
+			buildDeviceCondition(existing, domainConditionDomainProvisioned, provStatus, provReason, provMsg, now),
+			buildDeviceCondition(existing, domainConditionNodesReady, nodesStatus, nodesReason, nodesMsg, now),
+			buildDeviceCondition(existing, domainConditionCliqueSplit, splitStatus, splitReason, splitMsg, now),
+			buildDeviceCondition(existing, domainConditionReady, readyStatus, readyReason, readyMsg, now),
+		}
+
+		newDevices = append(newDevices, resourceapi.AllocatedDeviceStatus{
+			Driver:     res.Driver,
+			Pool:       res.Pool,
+			Device:     res.Device,
+			ShareID:    shareID,
+			Conditions: conditions,
+			Data: &runtime.RawExtension{
+				Raw: rawData,
+			},
+		})
+	}
+
+	if allocatedDeviceStatusesEqual(claim.Status.Devices, newDevices) {
+		return nil
+	}
+
+	newClaim := claim.DeepCopy()
+	newClaim.Status.Devices = newDevices
+	updated, err := m.config.clientsets.Core.ResourceV1().ResourceClaims(newClaim.Namespace).UpdateStatus(ctx, newClaim, metav1.UpdateOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("error updating ResourceClaim %s/%s device status: %w", newClaim.Namespace, newClaim.Name, err)
+	}
+	m.mutationCache.Mutation(updated)
+	return nil
+}
+
+func findExistingAllocatedDeviceStatus(devices []resourceapi.AllocatedDeviceStatus, driver, pool, device string, shareID *string) *resourceapi.AllocatedDeviceStatus {
+	for i := range devices {
+		d := &devices[i]
+		if d.Driver == driver && d.Pool == pool && d.Device == device && stringPtrEqual(d.ShareID, shareID) {
+			return d
+		}
+	}
+	return nil
+}
+
+func buildDeviceCondition(existing *resourceapi.AllocatedDeviceStatus, condType string, status metav1.ConditionStatus, reason, message string, now metav1.Time) metav1.Condition {
+	transitionTime := now
+	if existing != nil {
+		for i := range existing.Conditions {
+			c := &existing.Conditions[i]
+			if c.Type == condType && c.Status == status && !c.LastTransitionTime.IsZero() {
+				transitionTime = c.LastTransitionTime
+				break
+			}
+		}
+	}
+	return metav1.Condition{
+		Type:               condType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: transitionTime,
+	}
+}
+
+func stringPtrEqual(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func allocatedDeviceStatusesEqual(a, b []resourceapi.AllocatedDeviceStatus) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Driver != b[i].Driver || a[i].Pool != b[i].Pool || a[i].Device != b[i].Device || !stringPtrEqual(a[i].ShareID, b[i].ShareID) {
+			return false
+		}
+		if len(a[i].Conditions) != len(b[i].Conditions) {
+			return false
+		}
+		for j := range a[i].Conditions {
+			ca := &a[i].Conditions[j]
+			cb := &b[i].Conditions[j]
+			if ca.Type != cb.Type || ca.Status != cb.Status || ca.Reason != cb.Reason || ca.Message != cb.Message {
+				return false
+			}
+		}
+		var rawA, rawB []byte
+		if a[i].Data != nil {
+			rawA = a[i].Data.Raw
+		}
+		if b[i].Data != nil {
+			rawB = b[i].Data.Raw
+		}
+		if !bytes.Equal(rawA, rawB) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *DomainClaimManager) cleanupClaimResources(ctx context.Context, cdUID string) error {
