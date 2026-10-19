@@ -24,6 +24,7 @@ import (
 	"text/template"
 
 	appsv1 "k8s.io/api/apps/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,7 +40,8 @@ import (
 )
 
 const (
-	DaemonSetTemplatePath = "/templates/compute-domain-daemon.tmpl.yaml"
+	DaemonSetTemplatePath                 = "/templates/compute-domain-daemon.tmpl.yaml"
+	staticDaemonResourceClaimTemplateName = "compute-domain-daemon"
 )
 
 type DaemonSetTemplateData struct {
@@ -48,6 +50,8 @@ type DaemonSetTemplateData struct {
 	Finalizer                 string
 	ComputeDomainLabelKey     string
 	ComputeDomainLabelValue   types.UID
+	ComputeDomainName         string
+	ComputeDomainNamespace    string
 	ResourceClaimTemplateName string
 	ImageName                 string
 	MaxNodesPerIMEXDomain     int
@@ -222,6 +226,45 @@ func (m *DaemonSetManager) Create(ctx context.Context, cd *nvapi.ComputeDomain) 
 		PriorityClassName:         m.config.cdDaemonPriorityClassName,
 	}
 
+	return m.createFromTemplateData(ctx, templateData)
+}
+
+// CreateForClaim creates the per-domain IMEX DaemonSet for an allocated domain
+// ResourceClaim using the claim's UID, Name, and Namespace as domain identity.
+func (m *DaemonSetManager) CreateForClaim(ctx context.Context, claim *resourceapi.ResourceClaim) (*appsv1.DaemonSet, error) {
+	ds, err := getByComputeDomainUID[*appsv1.DaemonSet](ctx, m.mutationCache, string(claim.UID))
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving DaemonSet: %w", err)
+	}
+	if len(ds) > 1 {
+		return nil, fmt.Errorf("more than one DaemonSet found with same ComputeDomain UID")
+	}
+	if len(ds) == 1 {
+		return ds[0], nil
+	}
+
+	templateData := DaemonSetTemplateData{
+		Namespace:                 m.config.driverNamespace,
+		Name:                      fmt.Sprintf("computedomain-daemon-%s", claim.UID),
+		Finalizer:                 computeDomainFinalizer,
+		ComputeDomainLabelKey:     computeDomainLabelKey,
+		ComputeDomainLabelValue:   claim.UID,
+		ComputeDomainName:         claim.Name,
+		ComputeDomainNamespace:    claim.Namespace,
+		ResourceClaimTemplateName: staticDaemonResourceClaimTemplateName,
+		ImageName:                 m.config.imageName,
+		MaxNodesPerIMEXDomain:     m.config.maxNodesPerIMEXDomain,
+		IMEXConfigOverrides:       m.config.imexConfigOverrides,
+		FeatureGates:              featuregates.ToMap(),
+		LogVerbosity:              m.config.logVerbosityCDDaemon,
+		ImagePullSecretNames:      m.config.imagePullSecretNames,
+		PriorityClassName:         m.config.cdDaemonPriorityClassName,
+	}
+
+	return m.createFromTemplateData(ctx, templateData)
+}
+
+func (m *DaemonSetManager) createFromTemplateData(ctx context.Context, templateData DaemonSetTemplateData) (*appsv1.DaemonSet, error) {
 	tmpl, err := template.ParseFiles(DaemonSetTemplatePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse template file: %w", err)
@@ -382,7 +425,7 @@ func (m *DaemonSetManager) onAddOrUpdate(ctx context.Context, obj any) error {
 	if err != nil {
 		return fmt.Errorf("error getting ComputeDomain: %w", err)
 	}
-	if cd == nil {
+	if cd == nil || cd.Spec.NumNodes <= 0 {
 		return nil
 	}
 

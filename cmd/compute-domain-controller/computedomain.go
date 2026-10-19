@@ -80,6 +80,7 @@ type ComputeDomainManager struct {
 	resourceClaimTemplateManager *WorkloadResourceClaimTemplateManager
 	nodeManager                  *NodeManager
 	domainSliceManager           *DomainSliceManager
+	domainClaimManager           *DomainClaimManager
 }
 
 // NewComputeDomainManager creates a new ComputeDomainManager.
@@ -96,10 +97,13 @@ func NewComputeDomainManager(config *ManagerConfig) *ComputeDomainManager {
 	}
 
 	if !config.imexConfig.EffectiveHostManaged() {
-		m.daemonSetManager = NewMultiNamespaceDaemonSetManager(config, m.Get, m.List, m.UpdateStatus)
-		m.nodeManager = NewNodeManager(config, m.Get)
+		m.daemonSetManager = NewMultiNamespaceDaemonSetManager(config, m.getComputeDomain, m.List, m.UpdateStatus)
+		m.nodeManager = NewNodeManager(config, m.getComputeDomain)
+		if config.enableDomainDevices {
+			m.domainClaimManager = NewDomainClaimManager(config, m.daemonSetManager.managers[config.driverNamespace], m.nodeManager)
+		}
 	}
-	m.resourceClaimTemplateManager = NewWorkloadResourceClaimTemplateManager(config, m.Get)
+	m.resourceClaimTemplateManager = NewWorkloadResourceClaimTemplateManager(config, m.getComputeDomain)
 	if config.enableDomainDevices {
 		m.domainSliceManager = NewDomainSliceManager(config)
 	}
@@ -159,6 +163,12 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		return fmt.Errorf("informer cache sync for ComputeDomains failed")
 	}
 
+	if m.domainClaimManager != nil {
+		if err := m.domainClaimManager.Start(ctx); err != nil {
+			return fmt.Errorf("error starting DomainClaim manager: %w", err)
+		}
+	}
+
 	if m.daemonSetManager != nil {
 		if err := m.daemonSetManager.Start(ctx); err != nil {
 			return fmt.Errorf("error starting DaemonSet manager: %w", err)
@@ -185,6 +195,11 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 }
 
 func (m *ComputeDomainManager) Stop() error {
+	if m.domainClaimManager != nil {
+		if err := m.domainClaimManager.Stop(); err != nil {
+			return fmt.Errorf("error stopping DomainClaim manager: %w", err)
+		}
+	}
 	if m.domainSliceManager != nil {
 		if err := m.domainSliceManager.Stop(); err != nil {
 			return fmt.Errorf("error stopping DomainSlice manager: %w", err)
@@ -227,6 +242,35 @@ func (m *ComputeDomainManager) Get(uid string) (*nvapi.ComputeDomain, error) {
 		return nil, fmt.Errorf("failed to cast to ComputeDomain")
 	}
 	return cd, nil
+}
+
+// getComputeDomain looks up a ComputeDomain CR by UID and falls back to
+// synthesizing an active domain ComputeDomain stub when uid belongs to an
+// allocated, non-deleting domain ResourceClaim. This keeps NodeManager and
+// DaemonSetManager periodic CleanupManagers from deleting active domain-claim
+// resources.
+func (m *ComputeDomainManager) getComputeDomain(uid string) (*nvapi.ComputeDomain, error) {
+	cd, err := m.Get(uid)
+	if err != nil || cd != nil {
+		return cd, err
+	}
+	if m.domainClaimManager != nil {
+		claim, err := m.domainClaimManager.GetActiveDomainClaim(uid)
+		if err != nil || claim == nil {
+			return nil, err
+		}
+		return &nvapi.ComputeDomain{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:       claim.UID,
+				Name:      claim.Name,
+				Namespace: claim.Namespace,
+			},
+			Spec: nvapi.ComputeDomainSpec{
+				NumNodes: -1,
+			},
+		}, nil
+	}
+	return nil, nil
 }
 
 // List returns all ComputeDomains from the informer cache.

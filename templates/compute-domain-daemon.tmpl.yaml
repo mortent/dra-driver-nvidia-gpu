@@ -44,6 +44,14 @@ spec:
         # above because of klogs limited configuration interface.
         - name: LOG_VERBOSITY
           value: "{{ .LogVerbosity }}"
+        {{- if .ComputeDomainName }}
+        - name: COMPUTE_DOMAIN_UUID
+          value: "{{ .ComputeDomainLabelValue }}"
+        - name: COMPUTE_DOMAIN_NAME
+          value: "{{ .ComputeDomainName }}"
+        - name: COMPUTE_DOMAIN_NAMESPACE
+          value: "{{ .ComputeDomainNamespace }}"
+        {{- end }}
         - name: MAX_NODES_PER_IMEX_DOMAIN
           value: "{{ .MaxNodesPerIMEXDomain }}"
         {{- if .IMEXConfigOverrides }}
