@@ -73,6 +73,7 @@ type ComputeDomainManager struct {
 	cliqueID   string
 
 	getCliqueIDFunc func() (string, error)
+	isClaimPrepared func(uid string) bool
 }
 
 type ComputeDomainDaemonSettings struct {
@@ -213,7 +214,11 @@ func (m *ComputeDomainManager) GetComputeDomainChannelContainerEdits(devRoot str
 
 // GetCDIContainerEditsCommon() returns the CDI spec edits always required for
 // launching the CD Daemon (whether or not it tries to launch an IMEX daemon
-// internally).
+// internally). When no ComputeDomain CR exists for s.domainID (static
+// compute-domain-daemon ResourceClaimTemplate flow), COMPUTE_DOMAIN_UUID,
+// COMPUTE_DOMAIN_NAME, and COMPUTE_DOMAIN_NAMESPACE are already provided on the
+// DaemonSet pod template environment, so only CLIQUE_ID and the /imexd mount
+// are injected via CDI.
 func (s *ComputeDomainDaemonSettings) GetCDIContainerEditsCommon(ctx context.Context) (*cdiapi.ContainerEdits, error) {
 	cd, err := s.manager.GetComputeDomain(ctx, s.domainID)
 	if err != nil {
@@ -626,9 +631,13 @@ func (m *ComputeDomainManager) periodicCleanup(ctx context.Context) {
 					continue
 				}
 
-				// Convention: per-CD directory with CD UID as basename
+				// Convention: per-CD or per-daemon-claim directory with UID as basename.
 				uid := e.Name()
 				path := filepath.Join(m.configFilesRoot, e.Name())
+
+				if m.isClaimPrepared != nil && m.isClaimPrepared(uid) {
+					continue
+				}
 
 				computeDomain, err := m.GetComputeDomain(ctx, uid)
 				if err != nil {

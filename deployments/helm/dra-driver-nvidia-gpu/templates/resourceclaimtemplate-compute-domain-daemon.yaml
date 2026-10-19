@@ -1,0 +1,17 @@
+{{- if and .Values.resources.computeDomains.enabled (not (include "dra-driver-nvidia-gpu.hostManagedIMEX" .)) }}
+---
+apiVersion: {{ include "dra-driver-nvidia-gpu.resourceApiVersion" . }}
+kind: ResourceClaimTemplate
+metadata:
+  name: compute-domain-daemon
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+spec:
+  spec:
+    devices:
+      requests:
+      - name: daemon
+        exactly:
+          deviceClassName: compute-domain-daemon.nvidia.com
+{{- end }}

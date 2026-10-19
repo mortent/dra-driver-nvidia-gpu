@@ -134,6 +134,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		nvdevlib:             nvdevlib,
 		checkpointManager:    checkpointManager,
 	}
+	computeDomainManager.isClaimPrepared = state.isDomainOrClaimPrepared
 	state.checkpointCleanupManager = NewCheckpointCleanupManager(state, config.clientsets.Resource)
 
 	checkpoints, err := state.checkpointManager.ListCheckpoints()
@@ -183,6 +184,30 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	}
 
 	return state, nil
+}
+
+// isDomainOrClaimPrepared reports whether uid corresponds to a currently
+// prepared claim UID or a prepared device group's ComputeDomain ID in the
+// local checkpoint.
+func (s *DeviceState) isDomainOrClaimPrepared(uid string) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	cp, err := s.getCheckpoint()
+	if err != nil || cp == nil || cp.V2 == nil {
+		return true
+	}
+	if _, exists := cp.V2.PreparedClaims[uid]; exists {
+		return true
+	}
+	for _, pc := range cp.V2.PreparedClaims {
+		for _, group := range pc.PreparedDevices {
+			if group.ConfigState.ComputeDomain == uid {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isDomainDeviceResult reports whether an allocation result targets a shared
