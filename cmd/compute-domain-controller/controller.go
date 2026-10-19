@@ -52,6 +52,15 @@ type ManagerConfig struct {
 	// through to dynamically rendered compute-domain-daemon DaemonSets.
 	imexConfigOverrides map[string]string
 
+	// enableDomainDevices controls whether per-clique domain ResourceSlices are published.
+	enableDomainDevices bool
+
+	// domainTopologyKey is the node label key used to group nodes into domain ResourceSlice pools.
+	domainTopologyKey string
+
+	// domainNodeSelector is an optional label selector restricting which nodes are included in domain pools.
+	domainNodeSelector string
+
 	// clientsets provides access to various Kubernetes API client interfaces
 	clientsets flags.ClientSets
 
@@ -105,6 +114,9 @@ func (c *Controller) Run(ctx context.Context) error {
 		maxNodesPerIMEXDomain:     c.config.flags.maxNodesPerIMEXDomain,
 		imexConfig:                c.config.imexConfig,
 		imexConfigOverrides:       c.config.imexConfigOverrides,
+		enableDomainDevices:       c.config.flags.enableDomainDevices,
+		domainTopologyKey:         c.config.flags.domainTopologyKey,
+		domainNodeSelector:        c.config.flags.domainNodeSelector,
 		clientsets:                c.config.clientsets,
 		workQueue:                 workQueue,
 		logVerbosityCDDaemon:      c.config.flags.logVerbosityCDDaemon,

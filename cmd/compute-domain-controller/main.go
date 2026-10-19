@@ -57,6 +57,10 @@ const (
 	// this for now. It can be overridden as an environment variable or
 	// command line argument as required.
 	defaultMaxNodesPerIMEXDomain = 18
+
+	// defaultDomainTopologyKey is the default node label key used to group
+	// nodes into NVLink domain ResourceSlice pools.
+	defaultDomainTopologyKey = "nvidia.com/gpu.clique"
 )
 
 type Flags struct {
@@ -72,6 +76,10 @@ type Flags struct {
 	imexMode            string
 	imexIsolation       string
 	imexConfigOverrides string
+
+	enableDomainDevices bool
+	domainTopologyKey   string
+	domainNodeSelector  string
 
 	httpEndpoint string
 	metricsPath  string
@@ -173,6 +181,27 @@ func newApp() *cli.App {
 			Usage:       "Comma-separated KEY=VALUE overrides for arbitrary nvidia-imex daemon config file settings generated in the driverManaged mode.",
 			Destination: &flags.imexConfigOverrides,
 			EnvVars:     []string{"IMEX_CONFIG_OVERRIDES"},
+		},
+		&cli.BoolFlag{
+			Name:        "enable-domain-devices",
+			Usage:       "Publish one capacity-less shareable domain ResourceSlice per NVLink clique.",
+			Value:       true,
+			Destination: &flags.enableDomainDevices,
+			EnvVars:     []string{"ENABLE_DOMAIN_DEVICES"},
+		},
+		&cli.StringFlag{
+			Name:        "domain-topology-key",
+			Usage:       "The node label key used to group nodes into NVLink domain pools.",
+			Value:       defaultDomainTopologyKey,
+			Destination: &flags.domainTopologyKey,
+			EnvVars:     []string{"DOMAIN_TOPOLOGY_KEY"},
+		},
+		&cli.StringFlag{
+			Name:        "domain-node-selector",
+			Usage:       "Optional label selector restricting which nodes are counted when publishing domain ResourceSlices.",
+			Value:       "",
+			Destination: &flags.domainNodeSelector,
+			EnvVars:     []string{"DOMAIN_NODE_SELECTOR"},
 		},
 		&cli.StringFlag{
 			Category:    "HTTP server:",
